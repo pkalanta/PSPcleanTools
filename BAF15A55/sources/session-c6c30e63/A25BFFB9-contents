@@ -254,9 +254,7 @@ classify_tree_status <- function(Trees) {
 
 
 
-
-
-
+git commit -m "Refactored key functions in PSPcleanTools
 
 
 
