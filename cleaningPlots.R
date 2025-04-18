@@ -1,0 +1,266 @@
+#' Detect and Flag DBH Outliers
+#'
+#' @description
+#' This function flags static and dynamic DBH (Diameter at Breast Height) outliers
+#' and returns the full dataset with flags, along with subsets of flagged entries.
+#' It helps identify implausible or extreme values in tree growth data.
+#'
+#' @param Trees A `data.table` containing tree measurement data.
+#'   Must include the columns: `"DBH"`, `"Plot"`, `"treenum"`, `"MeasYr"`.
+#' @param dbh_col Name of the DBH column. Default is `"DBH"`.
+#' @param year_col Name of the measurement year column. Default is `"MeasYr"`.
+#' @param plot_col Name of the plot identifier column. Default is `"Plot"`.
+#' @param tree_col Name of the tree identifier column. Default is `"treenum"`.
+#'
+#' @return A list with:
+#' \describe{
+#'   \item{Trees}{The full `data.table` with additional columns: `DBH_flag`, `DBH_growth`, and `Growth_flag`.}
+#'   \item{Small_Sapling}{Subset of trees flagged as "Small_Sapling".}
+#'   \item{Impossible}{Subset of trees flagged as "Impossible".}
+#'   \item{Exceptional}{Subset of trees flagged as "Exceptional".}
+#'   \item{VerifyData}{Subset of trees flagged as "VerifyData".}
+#' }
+#'
+#' @export
+#'
+#' @import data.table
+#' @importFrom dplyr filter mutate group_by summarise left_join ungroup case_when
+#' @importFrom magrittr %>%
+#'
+#`
+detect_DBH_outliers <- function(Trees,                   # The input dataset as a data.table, containing repeated  DBH measurements of trees across plots and years.
+                                dbh_col = "DBH",         # Optional arguments (dbh_col, year_col, plot_col, tree_col) allowing the user to specify column names if they differ from the defaults ("DBH", "MeasYr", etc.).
+                                year_col = "MeasYr",
+                                plot_col = "Plot",
+                                tree_col = "treenum")
+
+{
+
+  Trees <- as.data.table(Trees)   # Convert to data.table for speed and syntax simplicity. Ensures the input dataset is in data.table format, which enables efficient grouping and column operations
+
+  # A: STATIC FLAG — check unreasonable DBH values
+  #  This part uses nested fifelse() statements to assign flags based on the absolute DBH value:
+  Trees[, DBH_flag := fifelse(get(dbh_col) <= 0, "Invalid",                               # clearly incorrect.
+                              fifelse(get(dbh_col) <= 5, "Small_Sapling",                 # typically very young or unmeasured trees.
+                                      fifelse(get(dbh_col) > 400, "Impossible",           # extremely rare trees, worth verifying.
+                                              fifelse(get(dbh_col) > 200, "Exceptional",  # relatively large trees that may require verification.
+                                                      fifelse(get(dbh_col) > 90 & get(dbh_col) <= 200, "VerifyData", "OK")))))]  # other values are considered valid.
+
+  # B: ORDER by plot, tree, year
+  # Dynamic Growth Rate Check (per tree across years):
+  setorderv(Trees, cols = c(plot_col, tree_col, year_col))    # Sorts the data by plot, tree, and measurement year to ensure correct growth sequence.
+
+  # C: GROWTH CHECK — calculate DBH growth per tree across years
+  Trees[, DBH_growth := c(NA, diff(get(dbh_col))) / c(NA, diff(get(year_col))),    # NA is used for the first measurement because there's no previous value to compare to
+        by = .(get(plot_col), get(tree_col))]
+
+  # D: FLAG dynamic outliers (negative or unusually fast growth)
+  Trees[, Growth_flag := fifelse(DBH_growth < -0.5, "Negative",                      # Shrinking DBH more than 0.5 cm/year,  likely erroneous.
+                                 fifelse(DBH_growth > 2.5, "TooFast", "OK"))]        # Growth > 2.5 cm/year, suspiciously fast. OK": Acceptable range.
+
+  # E: Subset flagged trees. These subsets are filtered for each type of DBH issue (excluding "Invalid" since it's rare or possibly already filtered elsewhere).
+  Sapling     <- Trees[DBH_flag == "Small_Sapling"]
+  Impossible  <- Trees[DBH_flag == "Impossible"]
+  Exceptional <- Trees[DBH_flag == "Exceptional"]
+  VerifyData  <- Trees[DBH_flag == "VerifyData"]
+
+  # Return a list with full and filtered results
+  # The full dataset with added DBH_flag, DBH_growth, and Growth_flag columns. Each flagged subset e.g., saplings, impossible values
+  return(list(
+    Trees = Trees,
+    Sapling = Sapling,
+    Impossible = Impossible,
+    Exceptional = Exceptional,
+    VerifyData = VerifyData
+  ))
+}
+
+#' Assign Tree Numbers to Plots with Multiple PSP Instances
+#'
+#' @description
+#' Ensures consistent tree numbering in cases where the same Permanent Sample Plot (PSP) location appears multiple times across years.
+#' This helps in tracking individual trees over time and prevents confusion caused by duplicated or missing IDs.
+#'
+#' @param Trees A `data.table` of tree observations containing PSP identifiers and measurement years.
+#'
+#' @return A `data.table` with updated and harmonized tree numbers across PSP entries.
+#'
+#' @export
+#'
+#' @import data.table
+#' @importFrom dplyr group_by mutate ungroup
+#' @importFrom magrittr %>%
+#'
+#  Identifies cases where a single treenum within a Plot is associated with more than one PSP, which indicates inconsistent or incorrect data entry.
+#  Defines the treenum_to_multiplePSP() function that takes as input a data frame or tibble called Trees.
+treenum_to_multiplePSP <- function(Trees) {
+  incorrect_trees <- Trees %>%
+    group_by(Plot, treenum) %>%               # roups the data by unique tree identifiers within plots.
+    filter(n_distinct(PSP) > 1) %>%           # Keeps only those groups where the same tree appears under more than one PSP.
+    ungroup()                                 # Returns to a non-grouped data frame for the next operations.
+
+  # Determines the correct PSP and Latin_full (species name) for each problematic tree based on frequency.
+  correct_psp <- incorrect_trees %>%
+    group_by(Plot, treenum, PSP, Latin_full) %>%            # Groups again by Plot, treenum, PSP, and Latin_full to count how many times each combination occurs.
+    summarise(count = n(), .groups = "drop") %>%            # Tallies the number of times each combination appears.
+    arrange(desc(count)) %>%                                # Sorts rows so most frequent entries come first.
+    group_by(Plot, treenum) %>%
+    slice_max(count, with_ties = FALSE) %>%                 # Picks the most frequent combination (in case of ties, chooses only one).
+    ungroup() %>%
+    distinct(Plot, treenum, PSP, Latin_full)                # Keeps only the relevant columns, ensuring one corrected PSP/species per tree.
+
+  #Applies the corrections to the original data.
+  trees_corrected <- Trees %>%
+    left_join(correct_psp, by = c("Plot", "treenum")) %>%            # Merges the correction table (correct_psp) with the original dataset on Plot and treenum.
+    mutate(PSP = coalesce(PSP.y, PSP.x),                             # Chooses the corrected values (PSP.y, Latin_full.y) if available; otherwise, keeps the original (PSP.x, Latin_full.x).
+           Latin_full = coalesce(Latin_full.y, Latin_full.x)) %>%
+    select(-PSP.x, -PSP.y, -Latin_full.x, -Latin_full.y)             # Removes the temporary columns (.x and .y) created during the join.
+
+  return(list(incorrect_trees = incorrect_trees,                     # Rows with trees that had multiple PSPs (the problem).
+              correct_psp = correct_psp,                             # The most likely correct PSP and species per tree (the fix).
+              PSP_TREE_YIMO_corrected = trees_corrected))            # The final cleaned dataset, ready for analysis.
+}
+#' Process Implausible DBH Changes Across Measurement Years
+#'
+#' @description
+#' Detects and manages inconsistencies in tree diameter (DBH) measurements across years within PSPs.
+#' The function flags implausible negative growth, cleans the dataset accordingly, and excludes plots with a high proportion of anomalies.
+#' This helps improve the reliability of forest dynamics analysis.
+#'
+#' @param Trees A `data.table` of tree measurements over time within PSPs.
+#'
+#' @return A cleaned `data.table` with problematic entries removed or flagged.
+#'
+#' @export
+#'
+#' @import data.table
+#' @importFrom dplyr group_by summarise filter mutate case_when
+#' @importFrom magrittr %>%
+#`
+process_dbh_issues <- function(Trees, plots) {    # two arguments: Trees: a data frame containing tree measurements over time, and plots: a list of plot identifiers to focus the processing on.
+  Trees <- Trees %>% filter(Plot %in% plots)      # Filters the input data to include only the plots listed in plots, narrowing down the analysis to relevant data.
+
+  # Sorts the data chronologically by plot, tree ID (treenum), and measurement year (MeasYr).
+  # Within each tree’s record across years, calculates the difference in DBH (Diameter at Breast Height) between successive measurements to evaluate growth
+  Trees <- Trees %>%
+    arrange(Plot, treenum, MeasYr) %>%
+    group_by(Plot, treenum) %>%
+    mutate(diff_dbh = DBH - lag(DBH))  # # A negative value indicates a reduction in DBH, which is biologically implausible in most cases and may indicate a measurement error.
+
+  # Creates two diagnostic subsets:negative_growth and na_values
+  negative_growth <- Trees %>% filter(diff_dbh < -0.5)  # trees showing suspicious negative growth greater than 0.5 cm (used as a threshold for likely error).
+  na_values <- Trees %>% filter(is.na(diff_dbh))        # records where diff_dbh is NA (typically the first measurement for a tree).
+
+  Trees <- Trees %>%
+    mutate(DBH = ifelse(is.na(DBH) | DBH == 0, -1, DBH))   # Replaces missing (NA) or zero DBH values with -1 to flag them clearly as invalid values.
+
+  dbh_issues <- Trees %>%
+    filter(diff_dbh < 0) %>%                                                       # Filters out all records with negative growth for inspection.
+    select(PSP, Plot, RemeasID, treenum, DBH, MeasYr, diff_dbh, MeasNum) %>%       # Selects only relevant columns and arranges them for easy review.
+    arrange(Plot, treenum, MeasYr)
+
+  dbh_check <- dbh_issues %>%
+    left_join(Trees %>%   #   Joins dbh_issues with additional metadata (e.g., species name, cause of mortality, age class) to assist in diagnosing potential causes of measurement error.
+                select(PSP, Plot, RemeasID, treenum, MeasYr, Latin_full, cause, agecl, MeasNum),
+              by = c("PSP", "Plot", "RemeasID", "treenum", "MeasYr"))
+
+  # 📊 Calculate total negative growth percentage per plot
+  negative_growth_summary <- Trees %>%        # Computes a summary statistic per plot:
+    filter(!is.na(diff_dbh)) %>%
+    group_by(Plot) %>%
+    summarise(
+      total_neg_growth = sum(diff_dbh[diff_dbh < 0], na.rm = TRUE),                  # the sum of all negative DBH changes.
+      total_growth = sum(abs(diff_dbh), na.rm = TRUE),                               # the sum of absolute DBH changes (positive and negative).
+      neg_growth_pct = ifelse(total_growth > 0, 100 * abs(total_neg_growth) / total_growth, NA_real_) #  the percentage of negative growth relative to total measured change
+    ) %>%
+    arrange(Plot)
+
+  # Exports both the detailed issue log and the summary report to CSV files for further inspection or documentation
+  write.csv(dbh_check, "dbh_issues.csv", row.names = FALSE)
+  write.csv(negative_growth_summary, "negative_growth_summary.csv", row.names = FALSE)
+
+  # ❌ Remove plots with more than 5% negative growth
+  plots_to_keep <- negative_growth_summary %>%
+    filter(neg_growth_pct <= 5 | is.na(neg_growth_pct)) %>% # Keeps only plots where the negative DBH growth percentage is ≤ 5%, or missing (i.e., plots with no DBH change data).
+    pull(Plot)
+
+  Trees <- Trees %>% filter(Plot %in% plots_to_keep) # Removes plots with >5% negative DBH change from the final processed_data.
+
+  # Returns a list containing:
+  return(list(
+    processed_data = Trees,      # the cleaned and filtered tree dataset.
+    dbh_check = dbh_check,       # the table of detected DBH inconsistencies.
+    negative_growth_summary = negative_growth_summary     # plot-level statistics on negative growth.
+  ))
+}
+#' Classify tree status
+#'
+#' @description
+#' This function assigns a status to each tree record based on its observation history across measurement years.
+#' It identifies whether a tree is a new regeneration, was lost (due to mortality or removal), or persisted throughout the observation period.
+#'
+#' @param Trees A `data.table` of individual tree measurements within Permanent Sample Plots (PSPs).
+#'
+#' @return A list or `data.table` categorizing each tree as "Regeneration", "Mortality", or "Alive".
+#'
+#' @export
+#'
+#' @importFrom data.table data.table
+#' @importFrom dplyr filter mutate group_by summarise left_join ungroup case_when
+#' @importFrom magrittr %>%
+#'
+# Defines a function named classify_tree_status() that takes a single argument Trees, which is a data frame containing repeated tree measurements (e.g., PSP data).
+classify_tree_status <- function(Trees) {
+  measyr_interval_per_plot <- Trees %>%                    # Determine plot-level measurement interval, that defines the total monitoring duration for each plot.
+    group_by(Plot) %>%
+    summarise(first_plot_year = min(MeasYr, na.rm = TRUE), # Finds the earliest and latest measurement years.
+              last_plot_year = max(MeasYr, na.rm = TRUE))
+
+  measyr_interval_per_treenum <- Trees %>%                          # Determine tree-level measurement interval, that shows the observation window for each individual tree.
+    group_by(Plot, treenum) %>%
+    summarise(first_tree_year = min(MeasYr, na.rm = TRUE),          # Finds the first and last years the tree was measured.
+              last_tree_year = max(MeasYr, na.rm = TRUE)) %>%
+    ungroup()
+
+  #  Join plot-level data with tree-level data
+  measyr_interval_per_treenum <- measyr_interval_per_treenum %>%
+    left_join(measyr_interval_per_plot, by = "Plot")               # Adds the plot-level start and end years to each tree's record for comparison.
+
+  # Add the joined year info to the main dataset
+  Trees <- Trees %>%
+    left_join(measyr_interval_per_treenum, by = c("Plot", "treenum"))   # Integrates tree-level and plot-level back into the original Trees dataset, preparing it for classification.
+
+  #  Classify tree status
+  Trees <- Trees %>%
+    mutate(status = case_when(           # Uses case_when() to define the status of each tree record
+      MeasYr == first_tree_year & first_tree_year > first_plot_year ~ "Regeneration", # the tree appears after the start of monitoring (not present initially).
+      MeasYr == last_tree_year & last_tree_year < last_plot_year ~ "Last Measurement", # the tree was not measured again in the last year of the plot, indicating possible death or removal.
+      MeasYr > first_tree_year & MeasYr < last_tree_year ~ "Consistent",  # the tree appears between its first and last recorded years.
+      TRUE ~ "Survival"   # a default label for all other conditions, mostly trees present across the full duration.
+    ))
+
+  # Create status-based subsets
+  # Divides the classified dataset into three categories for later analysis or visualization:
+  Regen <- Trees %>% filter(status == "Regeneration")   # Regenerating trees.
+  Last_Measurement <- Trees %>% filter(status == "Last Measurement")    # Trees last seen before final plot year.
+  Alive <- Trees %>% filter(status %in% c("Consistent", "Survival"))   # Trees with consistent or full-survival presence.
+
+  # Writes the full Trees dataset with the newly classified status column to a CSV file
+  write.csv(Trees, "Status of trees due to be Alive, Last Measurement and Regeneration", row.names = FALSE)
+
+  #  Returns a list of datasets:Full tree data with status and Subsets by classification.
+  return(list(Trees = Trees, Regen = Regen, Last_Measurement = Last_Measurement, Alive = Alive))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+

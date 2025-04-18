@@ -23,9 +23,9 @@ Imports:
     sf,
     sp,
     raster,
-    dplyr,
+    dplyr
     data.table,
-    magrittr,
+    magrittr
     tidyr,
     readr,
     ggplot2

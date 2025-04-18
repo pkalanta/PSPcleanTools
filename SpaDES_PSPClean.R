@@ -16,7 +16,7 @@ out <- SpaDES.project::setupProject(
                modulePath = "modules"),
   modules = c("PredictiveEcology/Biomass_speciesParameters@manual"),
   packages = c('RCurl', 'XML', 'snow', 'googledrive', 'httr2', "gert", "remotes"
-               , "pkalanta/PSPclean@development (HEAD)"
+               , "pkalanta/PSPcleanTools"
                , "pkgload"
   ),
   times = list(start = 2011, end = 2012),

@@ -1,0 +1,82 @@
+#' Detect and Flag DBH Outliers
+#'
+#' @description
+#' This function flags static and dynamic DBH (Diameter at Breast Height) outliers
+#' and returns the full dataset with flags, along with subsets of flagged entries.
+#' It helps identify implausible or extreme values in tree growth data.
+#'
+#' @param Trees A `data.table` containing tree measurement data.
+#'   Must include the columns: `"DBH"`, `"Plot"`, `"treenum"`, `"MeasYr"`.
+#' @param dbh_col Name of the DBH column. Default is `"DBH"`.
+#' @param year_col Name of the measurement year column. Default is `"MeasYr"`.
+#' @param plot_col Name of the plot identifier column. Default is `"Plot"`.
+#' @param tree_col Name of the tree identifier column. Default is `"treenum"`.
+#'
+#' @return A list with:
+#' \describe{
+#'   \item{Trees}{The full `data.table` with additional columns: `DBH_flag`, `DBH_growth`, and `Growth_flag`.}
+#'   \item{Small_Sapling}{Subset of trees flagged as "Small_Sapling".}
+#'   \item{Impossible}{Subset of trees flagged as "Impossible".}
+#'   \item{Exceptional}{Subset of trees flagged as "Exceptional".}
+#'   \item{VerifyData}{Subset of trees flagged as "VerifyData".}
+#' }
+#'
+#' @export
+#'
+#' @import data.table
+#' @importFrom dplyr filter mutate group_by summarise left_join ungroup case_when
+#' @importFrom magrittr %>%
+#'
+#' @examples
+#' result <- detect_dbh_outlier(Trees = PSP_TREE_YIMO)
+#' result$Impossible
+#' result$Trees
+#`
+detect_DBH_outliers <- function(Trees,                   # The input dataset as a data.table, containing repeated  DBH measurements of trees across plots and years.
+                                dbh_col = "DBH",         # Optional arguments (dbh_col, year_col, plot_col, tree_col) allowing the user to specify column names if they differ from the defaults ("DBH", "MeasYr", etc.).
+                                year_col = "MeasYr",
+                                plot_col = "Plot",
+                                tree_col = "treenum")
+
+  {
+
+   Trees <- as.data.table(Trees)   # Convert to data.table for speed and syntax simplicity. Ensures the input dataset is in data.table format, which enables efficient grouping and column operations
+
+  # A: STATIC FLAG — check unreasonable DBH values
+  #  This part uses nested fifelse() statements to assign flags based on the absolute DBH value:
+  Trees[, DBH_flag := fifelse(get(dbh_col) <= 0, "Invalid",                               # clearly incorrect.
+                              fifelse(get(dbh_col) <= 5, "Small_Sapling",                 # typically very young or unmeasured trees.
+                                      fifelse(get(dbh_col) > 400, "Impossible",           # extremely rare trees, worth verifying.
+                                              fifelse(get(dbh_col) > 200, "Exceptional",  # relatively large trees that may require verification.
+                                                      fifelse(get(dbh_col) > 90 & get(dbh_col) <= 200, "VerifyData", "OK")))))]  # other values are considered valid.
+
+  # B: ORDER by plot, tree, year
+  # Dynamic Growth Rate Check (per tree across years):
+  setorderv(Trees, cols = c(plot_col, tree_col, year_col))    # Sorts the data by plot, tree, and measurement year to ensure correct growth sequence.
+
+  # C: GROWTH CHECK — calculate DBH growth per tree across years
+  Trees[, DBH_growth := c(NA, diff(get(dbh_col))) / c(NA, diff(get(year_col))),    # NA is used for the first measurement because there's no previous value to compare to
+        by = .(get(plot_col), get(tree_col))]
+
+  # D: FLAG dynamic outliers (negative or unusually fast growth)
+  Trees[, Growth_flag := fifelse(DBH_growth < -0.5, "Negative",                      # Shrinking DBH more than 0.5 cm/year,  likely erroneous.
+                                 fifelse(DBH_growth > 2.5, "TooFast", "OK"))]        # Growth > 2.5 cm/year, suspiciously fast. OK": Acceptable range.
+
+  # E: Subset flagged trees. These subsets are filtered for each type of DBH issue (excluding "Invalid" since it's rare or possibly already filtered elsewhere).
+  Sapling     <- Trees[DBH_flag == "Small_Sapling"]
+  Impossible  <- Trees[DBH_flag == "Impossible"]
+  Exceptional <- Trees[DBH_flag == "Exceptional"]
+  VerifyData  <- Trees[DBH_flag == "VerifyData"]
+
+  # Return a list with full and filtered results
+  # The full dataset with added DBH_flag, DBH_growth, and Growth_flag columns. Each flagged subset e.g., saplings, impossible values
+  return(list(
+    Trees = Trees,
+    Sapling = Sapling,
+    Impossible = Impossible,
+    Exceptional = Exceptional,
+    VerifyData = VerifyData
+  ))
+}
+
+
